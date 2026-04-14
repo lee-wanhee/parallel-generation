@@ -1,166 +1,162 @@
-# Parallel Generation: Methods and Results
+# Parallel Generation: How Fast Can We Resolve Uncertainty?
+
+## Research Question
+
+Given sequences with structured dependencies, what is the minimum number of steps needed to generate a valid sequence? Can parallel generation methods match the theoretical lower bound — the **sequential depth** of the dependency structure?
 
 ## Setup
 
-We train tiny transformers (2 layers, 64-dim, 4 heads) on exactly two sequences with equal probability:
+### Structured Uncertainty Datasets
 
-| Sequence | Tokens |
-|----------|--------|
-| 1 | `<BOS> I am <EOS>` |
-| 2 | `<BOS> We are <EOS>` |
+We design sequences as dependency trees. Each sequence has a **sequential depth N**: the minimum number of sequential decisions needed to fully determine all tokens. Tokens below a resolved branch can be generated in parallel.
 
-This is a minimal testbed where the conditional dependency is absolute: knowing token 1 completely determines token 2. Any method that breaks this dependency will produce invalid sequences like "I are" or "We am".
+| Dataset | Depth | # Seqs | Length | Structure |
+|---------|-------|--------|--------|-----------|
+| independent | 0 | 8 | 5 | All tokens independent — fully parallelizable |
+| depth1 | 1 | 2 | 4 | 1 branch → 1 determined token |
+| depth1_wide | 1 | 2 | 7 | 1 branch → 4 determined tokens (high parallelism) |
+| depth2 | 2 | 4 | 5 | 2 sequential branches → 1 determined token |
+| depth3 | 3 | 8 | 6 | 3 sequential branches (binary tree) |
+| mixed | 1 or 2 | 6 | 5 | Mix of depth-1 and depth-2 sequences |
 
----
+**Example — depth1_wide:** After resolving a single branching token (A1 vs A2), four remaining tokens are completely determined and could theoretically be generated in one parallel step. So the theoretical minimum is **2 steps** (1 to resolve the branch + 1 to generate all leaves in parallel), not 5.
 
-## Baseline Results
+### Methods
 
-### Autoregressive Inference
-Standard left-to-right generation. Each token is sampled conditioned on all previous tokens.
-
-```
-<BOS> I am <EOS>      ~50%
-<BOS> We are <EOS>    ~50%
-Valid: 100%
-```
-
-### Naive Parallel Inference
-All positions predicted from `<BOS>` only, sampled independently.
-
-```
-<BOS> I I <EOS>       19.2%
-<BOS> We I <EOS>      18.5%
-<BOS> I We <EOS>      16.4%
-...
-Valid: <1%
-```
-
-Position 2 never sees what was sampled at position 1, so it predicts the marginal distribution (a mixture of "am" and "are") rather than the correct conditional. Result: mostly nonsense.
+| Method | Type | Retraining? | Distribution Preserved? |
+|--------|------|-------------|------------------------|
+| Autoregressive (AR) | Sequential | — | Yes |
+| Jacobi (argmax) | Iterative refinement | No | No (mode collapse) |
+| Jacobi (sampling) | Iterative refinement | No | Approximately |
+| Mask-Predict (MP) | Iterative unmasking | Yes (bidir) | No (mode collapse) |
+| Mask-Predict Adaptive (MP-Ad) | Adaptive unmasking | Yes (bidir) | No (mode collapse) |
+| Speculative Decoding | Draft & verify | No | Yes (exact) |
+| Diffusion (adaptive) | Iterative denoising | Yes (diffusion) | No (mode collapse) |
 
 ---
 
-## Method 1: Jacobi Decoding
+## Results
 
-**Paper lineage**: Lookahead Decoding (ICML 2024), Consistency LLMs (2024)
+### Steps to Resolve (lower is better)
 
-**Core idea**: Treat autoregressive generation as a fixed-point problem. Initialize all positions with random tokens, feed through the causal model, replace each position with the model's prediction, repeat until convergence.
+| Dataset | Depth | AR | Jac-A | Jac-S | MP | MP-Ad | Spec | Diff |
+|---------|-------|----|-------|-------|-----|-------|------|------|
+| independent | 0 | 3.00 | 2.30 | 8.29 | 3.00 | 3.00 | 3.01 | 3.00 |
+| depth1 | 1 | 2.00 | 2.42 | 5.75! | 2.00 | 2.00 | 2.29 | 2.00 |
+| **depth1_wide** | **1** | **5.00** | **4.70** | **17.48!** | **5.00** | **2.00** | **5.39** | **2.00** |
+| depth2 | 2 | 3.00 | 3.79 | 16.48! | 3.00 | 3.00 | 3.52 | 3.00 |
+| depth3 | 3 | 4.00 | 3.77 | 19.77! | 4.00 | 4.00 | 4.67 | 4.00 |
+| mixed | 1-2 | 3.00! | 3.92 | 19.14! | 3.00 | 3.00 | 3.60 | 2.00 |
 
-**Key property**: Uses the SAME causal model — no retraining needed.
+`!` = <100% validity
 
-### Results (argmax)
+### Validity
 
-```
-<BOS> We are <EOS>    100%
-Valid: 100%
-Average iterations: 2.26
-Convergence: 74% at iter 2, 26% at iter 3
-```
+| Dataset | AR | Jac-A | Jac-S | MP | MP-Ad | Spec | Diff |
+|---------|-----|-------|-------|-----|-------|------|------|
+| independent | 100% | 100% | 100% | 100% | 100% | 100% | 100% |
+| depth1 | 100% | 100% | 99.5% | 100% | 100% | 100% | 100% |
+| depth1_wide | 100% | 100% | 30.0% | 100% | 100% | 100% | 100% |
+| depth2 | 100% | 100% | 42.0% | 100% | 100% | 100% | 100% |
+| depth3 | 100% | 100% | 4.5% | 100% | 100% | 100% | 100% |
+| mixed | 99.5% | 100% | 15.5% | 100% | 100% | 100% | 100% |
 
-**Problem: mode collapse.** Argmax Jacobi always converges to the single highest-probability fixed point. Since the model is deterministic once you take argmax, every run converges to the same sequence. With two equally likely sequences, a slight numerical asymmetry makes it always pick "We are".
+### Diversity (bits of entropy; higher = more diverse)
 
-### Results (sampling)
-
-```
-<BOS> We are <EOS>    53.9%
-<BOS> I am <EOS>      45.2%
-<BOS> We am <EOS>      0.6%
-<BOS> I are <EOS>      0.3%
-Valid: 99.1%
-Average iterations: 5.91
-```
-
-Sampling-based Jacobi mostly recovers correct sequences (99.1% valid) but needs more iterations to converge and occasionally produces invalid outputs when sampling creates an unstable cycle.
-
-### Analysis
-
-Jacobi decoding is elegant: it reuses the autoregressive model and converges quickly. However:
-- **Argmax variant**: 100% valid but mode-collapses to one sequence
-- **Sampling variant**: Diverse but ~1% invalid, and convergence is slow (6 iterations avg vs 2 for argmax)
-- **Parallelism**: Each iteration is a single forward pass (all positions computed together), but multiple iterations needed
+| Dataset | Max | AR | Jac-A | Jac-S | MP | MP-Ad | Spec | Diff |
+|---------|-----|----|-------|-------|-----|-------|------|------|
+| independent | 3.00 | 2.98 | 0 | 2.94 | 0 | 0 | 2.98 | 0 |
+| depth1 | 1.00 | 0.99 | 0 | 1.04 | 0 | 0 | 1.00 | 0 |
+| depth1_wide | 1.00 | 1.00 | 0 | 4.43 | 0 | 0 | 1.00 | 0 |
+| depth2 | 2.00 | 1.97 | 0 | 4.51 | 0 | 0 | 2.00 | 0 |
+| depth3 | 3.00 | 2.98 | 0 | 7.26 | 0 | 0 | 2.99 | 0 |
+| mixed | 2.58 | 2.59 | 0 | 6.40 | 0 | 0 | 2.56 | 0 |
 
 ---
 
-## Method 2: Mask-Predict
+## Analysis
 
-**Paper**: "Mask-Predict: Parallel Decoding of Conditional Masked Language Models" (Ghazvininejad et al., 2019)
+### Key Finding 1: Adaptive methods exploit parallel structure
 
-**Core idea**: Train a bidirectional transformer with masked language modeling. At inference, start with all content positions masked `[BOS, MASK, MASK, EOS]`, predict all masked positions in parallel, keep the most confident predictions, re-mask the rest, and repeat.
+The **depth1_wide** dataset is the critical test. It has 5 content tokens but only 1 branching decision — after resolving the first token, 4 tokens are determined and can be generated in parallel.
 
-**Key property**: Requires a SEPARATE bidirectional model trained with masking.
+- **AR takes 5 steps** (one per token, left-to-right — blind to the parallel structure)
+- **Mask-Predict Adaptive and Diffusion take 2 steps** — they resolve the branch, then generate all 4 leaves in one parallel step
+- This matches the **theoretical minimum** of depth + 1 = 2
 
-### Results
+This demonstrates that **bidirectional methods (MP-Adaptive, Diffusion) can exploit parallel structure** that autoregressive methods cannot.
 
-```
-1 iteration:  <BOS> I am <EOS>   100%    Valid: 100%
-2 iterations: <BOS> I am <EOS>   100%    Valid: 100%
-3 iterations: <BOS> I am <EOS>   100%    Valid: 100%
-```
+### Key Finding 2: Most methods match depth + 1 on chain structures
 
-**Problem: mode collapse (same as Jacobi argmax).** The bidirectional model, when given `[BOS, MASK, MASK, EOS]`, always predicts the same sequence because it uses argmax. The model learns that both "I am" and "We are" are valid, but when both positions are masked simultaneously, it commits to one mode.
+For pure chain dependencies (depth1, depth2, depth3), most methods achieve steps ≈ depth + 1:
+- AR: exactly `num_content_tokens` (no parallelism exploited)
+- MP, MP-Adaptive, Diffusion: exactly `depth + 1` (matches theoretical minimum on chains)
+- Jacobi-argmax: close to `depth + 1` but slightly higher
+- Speculative: slightly above AR (overhead from rejected drafts)
 
-Even in a single iteration (fully parallel), the bidirectional model produces 100% valid sequences — it sees both BOS and EOS, allowing it to learn the correlation between positions 1 and 2. However, it only generates one of the two valid sequences.
+### Key Finding 3: The validity-diversity-speed trilemma
 
-### Analysis
+No single method achieves all three of: (1) 100% validity, (2) correct diversity, (3) minimum steps.
 
-Mask-Predict solves the validity problem completely — the bidirectional attention lets position 2 attend to position 1 even when both are initially masked, because they are refined together. But:
-- **Mode collapse**: argmax-based unmasking always picks the same mode
-- **Requires retraining**: Cannot reuse the causal autoregressive model
-- **Single iteration works**: For this simple problem, the bidirectional model can resolve dependencies in one pass
+| | Valid | Diverse | Fast |
+|--|-------|---------|------|
+| AR | Yes | Yes | No (always sequential) |
+| Jacobi-argmax | Yes | **No** (mode collapse) | Yes |
+| Jacobi-sampling | **No** (degrades with depth) | Yes | **No** (many iterations) |
+| MP / MP-Ad / Diff | Yes | **No** (mode collapse) | **Yes** (matches depth+1) |
+| Speculative | Yes | Yes | No (overhead from random drafts) |
 
----
+### Key Finding 4: Mode collapse is the central problem
 
-## Method 3: Speculative Decoding
+Jacobi-argmax, Mask-Predict, and Diffusion all achieve 0 bits of entropy — they always produce the same sequence. They use argmax decoding, which selects a single fixed point.
 
-**Papers**: "Fast Inference from Transformers via Speculative Decoding" (Leviathan et al., 2023), "Accelerating LLM Decoding with Speculative Sampling" (Chen et al., 2023)
+This is fundamentally different from the AR model, which naturally samples from the correct distribution. **The speed advantage of parallel methods comes at the cost of diversity.**
 
-**Core idea**: Generate draft tokens cheaply (here: random), then verify all of them against the target autoregressive model in a single forward pass. Accept the longest prefix where draft and target agree (with proper probability adjustment). Resample the first rejected position from the adjusted distribution.
+### Key Finding 5: Jacobi-sampling breaks on deeper structures
 
-**Key property**: Preserves the EXACT autoregressive distribution. Uses the same causal model.
+Jacobi with sampling maintains diversity but validity drops sharply with depth:
+- depth1: 99.5% valid
+- depth2: 42.0% valid
+- depth3: 4.5% valid
 
-### Results
-
-```
-<BOS> I am <EOS>      51.2%
-<BOS> We are <EOS>    48.8%
-Valid: 100%
-Average forward passes: 2.39 (vs 3 for autoregressive)
-```
-
-**This is the only method that achieves both 100% validity AND correct diversity** (50/50 split). The verification step guarantees that the output distribution exactly matches autoregressive sampling.
-
-### Analysis
-
-Speculative decoding is the gold standard for preserving quality:
-- **100% valid**: Verification catches all invalid drafts
-- **Correct distribution**: 50/50 split matches autoregressive exactly
-- **Speed**: 2.39 forward passes vs 3 for autoregressive (1.26x speedup)
-- **No retraining**: Uses the same causal model
-- **Limitation**: Speedup depends on draft quality. Random drafting gives modest gains; a good draft model would do better.
+The sampling creates unstable oscillations that prevent convergence to valid fixed points.
 
 ---
 
-## Summary
+## Towards Optimal Uncertainty Resolution
 
-| Method | Valid % | Diversity | Retraining? | Avg Forward Passes |
-|--------|---------|-----------|-------------|-------------------|
-| Autoregressive | 100% | 50/50 | — | 3 |
-| Naive Parallel | <1% | N/A | No | 1 |
-| Jacobi (argmax) | 100% | Mode collapse | No | 2.26 |
-| Jacobi (sampling) | 99.1% | ~50/50 | No | 5.91 |
-| Mask-Predict | 100% | Mode collapse | Yes | 1 |
-| Speculative Decoding | 100% | 50/50 | No | 2.39 |
+### The entropy-reduction hypothesis
 
-### Key Takeaways
+The ideal method should **maximize entropy reduction per step**:
 
-1. **Naive parallel generation fundamentally breaks conditional dependencies.** Even in a 2-sequence toy problem, it produces <1% valid outputs.
+1. **Identify the highest-entropy token** — the one whose resolution unlocks the most downstream tokens
+2. **Resolve it** — sample from its distribution
+3. **Propagate** — re-evaluate all remaining tokens given the new information
+4. **Generate in parallel** all tokens that are now determined (entropy ≈ 0)
 
-2. **Jacobi decoding** is the simplest fix (no retraining), and the sampling variant achieves 99.1% validity with correct diversity. But convergence is slow and not guaranteed.
+This is essentially what Mask-Predict Adaptive and Diffusion do when they achieve the depth+1 lower bound. But they lack the sampling step (2) — they use argmax instead of sampling, causing mode collapse.
 
-3. **Mask-Predict** achieves 100% validity in a single parallel pass thanks to bidirectional attention. But it requires retraining and suffers from mode collapse with argmax decoding.
+### What's missing: Sampling + Parallelism
 
-4. **Speculative decoding** is the only method that achieves both perfect validity and correct diversity without retraining. It is mathematically guaranteed to preserve the autoregressive distribution.
+The open problem is combining:
+- **Sampling** from the correct joint distribution (not just argmax)
+- **Parallel generation** of conditionally-determined tokens
+- **Adaptive scheduling** based on current entropy of each position
 
-5. **The fundamental tradeoff**: methods that are fully parallel (Mask-Predict, naive) tend toward mode collapse or invalid outputs. Methods that iterate (Jacobi, speculative) recover correctness at the cost of multiple passes. True single-pass parallel generation with correct diversity remains an open problem.
+A method that could do all three would:
+1. Sample the highest-entropy position (e.g., position 1 in depth1_wide)
+2. In the same or next step, generate all positions that become deterministic (positions 2-5 in depth1_wide) in parallel
+3. Achieve depth+1 steps with correct diversity
+
+### Possible approaches to investigate
+
+1. **Sampling-aware Mask-Predict**: Instead of argmax unmasking, sample the most uncertain position, then unmask all high-confidence positions in the next step.
+
+2. **Entropy-guided iterative refinement**: At each step, measure per-position entropy. Sample positions with entropy above a threshold. Commit positions with entropy near zero.
+
+3. **Speculative decoding with adaptive draft**: Instead of random drafts, use a bidirectional model to draft all positions, then verify with the AR model. The draft would be high-quality (exploiting parallel structure) and verification would preserve the correct distribution.
+
+4. **Diffusion with stochastic denoising**: Replace argmax in the diffusion reverse process with proper sampling, adjusted to maintain the correct marginals at each step.
 
 ---
 
@@ -169,6 +165,7 @@ Speculative decoding is the gold standard for preserving quality:
 - Ghazvininejad et al. "Mask-Predict: Parallel Decoding of Conditional Masked Language Models" (EMNLP 2019)
 - Leviathan et al. "Fast Inference from Transformers via Speculative Decoding" (ICML 2023)
 - Chen et al. "Accelerating Large Language Model Decoding with Speculative Sampling" (2023)
-- Santilli et al. "Accelerating Transformer Inference for Translation via Parallel Decoding" (ACL 2023) — Jacobi decoding
+- Santilli et al. "Accelerating Transformer Inference via Parallel Decoding" (ACL 2023)
 - Fu et al. "Break the Sequential Dependency of LLM Inference Using Lookahead Decoding" (ICML 2024)
 - Kou et al. "CLLMs: Consistency Large Language Models" (2024)
+- Austin et al. "Structured Denoising Diffusion Models in Discrete State-Spaces" (2021)
