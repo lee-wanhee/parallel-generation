@@ -228,6 +228,80 @@ def method_bidir_speculative(causal_model, bidir_model, dataset, num_samples=500
     return results, steps_list
 
 
+def method_bidir_speculative_fair(causal_model, bidir_model, dataset, num_samples=500):
+    """
+    Same as bidir_speculative but counts ALL forward passes
+    (both bidir draft passes AND AR verification passes).
+    This is the fair comparison metric.
+    """
+    V = dataset["V"]
+    mask_id = dataset["tok2id"]["<MASK>"]
+    bos_id = dataset["tok2id"]["<BOS>"]
+    eos_id = dataset["tok2id"]["<EOS>"]
+    content_pos = dataset["content_positions"]
+    seq_len = dataset["seq_len"]
+
+    causal_model.eval()
+    bidir_model.eval()
+    results = []
+    steps_list = []
+
+    with torch.no_grad():
+        for _ in range(num_samples):
+            tokens = [bos_id]
+            total_passes = 0
+
+            while len(tokens) < seq_len:
+                draft_seq = torch.zeros(1, seq_len, dtype=torch.long)
+                draft_seq[0, 0] = bos_id
+                draft_seq[0, -1] = eos_id
+                for i, tok in enumerate(tokens):
+                    draft_seq[0, i] = tok
+
+                unknown_pos = list(range(len(tokens), seq_len - 1))
+                for pos in unknown_pos:
+                    draft_seq[0, pos] = mask_id
+
+                # Draft: count these passes
+                masked = list(unknown_pos)
+                while masked:
+                    logits = bidir_model(draft_seq)
+                    total_passes += 1  # COUNT bidir passes
+                    best_pos, best_conf, best_pred = None, -1, None
+                    for pos in masked:
+                        probs = F.softmax(logits[0, pos], dim=-1)
+                        max_prob, pred = probs.max(dim=-1)
+                        if max_prob.item() > best_conf:
+                            best_pos = pos
+                            best_conf = max_prob.item()
+                            best_pred = pred.item()
+                    draft_seq[0, best_pos] = best_pred
+                    masked.remove(best_pos)
+
+                # Verify: count this pass too
+                x = torch.tensor([draft_seq[0].tolist()])
+                logits = causal_model(x)
+                total_passes += 1  # COUNT AR pass
+
+                for i in range(len(tokens), seq_len):
+                    target_probs = F.softmax(logits[0, i - 1], dim=-1)
+                    draft_tok = draft_seq[0, i].item()
+                    p_target = target_probs[draft_tok].item()
+                    if torch.rand(1).item() < p_target:
+                        tokens.append(draft_tok)
+                    else:
+                        tokens.append(torch.multinomial(target_probs, 1).item())
+                        break
+
+                if len(tokens) >= seq_len:
+                    break
+
+            steps_list.append(total_passes)
+            results.append(tuple(tokens[:seq_len]))
+
+    return results, steps_list
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════
