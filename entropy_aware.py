@@ -302,6 +302,78 @@ def method_bidir_speculative_fair(causal_model, bidir_model, dataset, num_sample
     return results, steps_list
 
 
+def method_bidir_speculative_parallel(causal_model, bidir_model, dataset, num_samples=500):
+    """
+    Bidir Speculative with PARALLEL draft:
+    1. One bidir forward pass to draft ALL positions at once (argmax)
+    2. One AR forward pass to verify
+    = 2 passes total per attempt
+
+    If verification rejects at position k, we keep tokens up to k,
+    then draft remaining positions again (2 more passes).
+    """
+    V = dataset["V"]
+    mask_id = dataset["tok2id"]["<MASK>"]
+    bos_id = dataset["tok2id"]["<BOS>"]
+    eos_id = dataset["tok2id"]["<EOS>"]
+    content_pos = dataset["content_positions"]
+    seq_len = dataset["seq_len"]
+
+    causal_model.eval()
+    bidir_model.eval()
+    results = []
+    steps_list = []
+
+    with torch.no_grad():
+        for _ in range(num_samples):
+            tokens = [bos_id]
+            total_passes = 0
+
+            while len(tokens) < seq_len:
+                draft_seq = torch.zeros(1, seq_len, dtype=torch.long)
+                draft_seq[0, 0] = bos_id
+                draft_seq[0, -1] = eos_id
+                for i, tok in enumerate(tokens):
+                    draft_seq[0, i] = tok
+
+                unknown_pos = list(range(len(tokens), seq_len - 1))
+                for pos in unknown_pos:
+                    draft_seq[0, pos] = mask_id
+
+                # SINGLE bidir pass: argmax all masked positions at once
+                logits = bidir_model(draft_seq)
+                total_passes += 1
+                for pos in unknown_pos:
+                    probs = F.softmax(logits[0, pos], dim=-1)
+                    probs[mask_id] = 0
+                    if probs.sum() > 0:
+                        probs = probs / probs.sum()
+                    draft_seq[0, pos] = probs.argmax()
+
+                # AR verification pass
+                x = torch.tensor([draft_seq[0].tolist()])
+                logits = causal_model(x)
+                total_passes += 1
+
+                for i in range(len(tokens), seq_len):
+                    target_probs = F.softmax(logits[0, i - 1], dim=-1)
+                    draft_tok = draft_seq[0, i].item()
+                    p_target = target_probs[draft_tok].item()
+                    if torch.rand(1).item() < p_target:
+                        tokens.append(draft_tok)
+                    else:
+                        tokens.append(torch.multinomial(target_probs, 1).item())
+                        break
+
+                if len(tokens) >= seq_len:
+                    break
+
+            steps_list.append(total_passes)
+            results.append(tuple(tokens[:seq_len]))
+
+    return results, steps_list
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════
